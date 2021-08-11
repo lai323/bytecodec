@@ -6,7 +6,7 @@ import (
 )
 
 type tmp struct {
-	l int `lengthref:s`
+	l int `bytecodec:"lengthref:s"`
 	s string
 }
 

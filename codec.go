@@ -144,8 +144,6 @@ type codec interface {
 	encode(e *codecState, v reflect.Value, to tagOptions)
 	decode(e *codecState, v reflect.Value, to tagOptions)
 	typ() reflect.Kind
-	// encodeBytes(v reflect.Value) ([]byte, error)
-	// decodeByLength(e *codecState, v reflect.Value, length int)
 }
 
 var codecCache sync.Map // map[reflect.Type]codec
@@ -241,9 +239,6 @@ func (byteCoderCoder) typ() reflect.Kind {
 }
 
 func (byteCoderCoder) encode(c *codecState, v reflect.Value, _ tagOptions) {
-	if v.Kind() == reflect.Ptr && v.IsNil() {
-		return
-	}
 	m, ok := v.Interface().(ByteCoder)
 	if !ok {
 		return
@@ -256,9 +251,6 @@ func (byteCoderCoder) encode(c *codecState, v reflect.Value, _ tagOptions) {
 }
 
 func (byteCoderCoder) decode(c *codecState, v reflect.Value, _ tagOptions) {
-	if v.Kind() == reflect.Ptr && v.IsNil() {
-		return
-	}
 	m, ok := v.Interface().(ByteCoder)
 	if !ok {
 		return
@@ -530,10 +522,22 @@ func (e *EncodeBCDErr) Error() string {
 	return "bytecodec EncodeBCDErr: " + e.Error()
 }
 
+type DecodeBCDErr struct{ error }
+
+func (e *DecodeBCDErr) Error() string {
+	return "bytecodec DecodeBCDErr: " + e.Error()
+}
+
 type TagErr struct{ error }
 
 func (e *TagErr) Error() string {
 	return "bytecodec TagErr: " + e.Error()
+}
+
+type LengthErr struct{ error }
+
+func (e *LengthErr) Error() string {
+	return "bytecodec LengthErr: " + e.Error()
 }
 
 type stringCoder struct {
@@ -543,34 +547,75 @@ func (stringCoder) typ() reflect.Kind {
 	return reflect.String
 }
 
-func (sc stringCoder) encode(c *codecState, v reflect.Value, _ tagOptions) {
-	c.Write([]byte(v.String()))
+func (sc stringCoder) encode(c *codecState, v reflect.Value, to tagOptions) {
+	str := v.String()
+	var length int
+
+	if to.bcd != 0 {
+		b, err := bcd8421.EncodeFromStr(str, to.bcd)
+		if err != nil {
+			c.error(&EncodeBCDErr{err})
+		}
+		length, _ = c.Write(b)
+		return
+	}
+
+	var strCodeing encoding.Encoding
+	if to.gbk {
+		strCodeing = simplifiedchinese.GBK
+	}
+	if to.gbk18030 {
+		strCodeing = simplifiedchinese.GB18030
+	}
+	if strCodeing != nil {
+		b, err := strCodeing.NewEncoder().Bytes([]byte(str))
+		if err != nil {
+			c.error(&EncodeGBKErr{err})
+		}
+		length, _ = c.Write(b)
+		return
+	}
+
+	length, _ = c.Write([]byte(str))
+	if to.length != 0 && length != to.length {
+		c.error(&LengthErr{fmt.Errorf("string length %d tag length %d", length, to.length)})
+	}
 }
 
-func (sc stringCoder) decode(c *codecState, v reflect.Value, _ tagOptions) {
-	// if sc.length == 0 {
-	// 	return
-	// }
-	// b := make([]byte, sc.length)
-	// c.Read(b)
+func (sc stringCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
+	var b []byte
+	if to.length != 0 {
+		b = make([]byte, to.length)
+		c.Read(b)
+	} else {
+		b = c.Bytes()
+	}
 
-	// var strCodeing encoding.Encoding
-	// if sc.gbk {
-	// 	strCodeing = simplifiedchinese.GB18030
-	// }
-	// if sc.gbk18030 {
-	// 	strCodeing = simplifiedchinese.GB18030
-	// }
-	// if strCodeing != nil {
-	// 	textbyte, err := strCodeing.NewDecoder().Bytes(b)
-	// 	if err != nil {
-	// 		c.error(&DecodeGBKErr{err})
-	// 	}
-	// 	v.SetString(string(textbyte))
-	// 	return
-	// }
-	// v.SetString(string(b))
-	v.SetString(string(c.Bytes()))
+	if to.bcd != 0 {
+		sb, err := bcd8421.DecodeToStr(b)
+		if err != nil {
+			c.error(&DecodeBCDErr{err})
+		}
+		v.SetString(string(sb))
+		return
+	}
+
+	var strCodeing encoding.Encoding
+	if to.gbk {
+		strCodeing = simplifiedchinese.GBK
+	}
+	if to.gbk18030 {
+		strCodeing = simplifiedchinese.GB18030
+	}
+	if strCodeing != nil {
+		sb, err := strCodeing.NewDecoder().Bytes(b)
+		if err != nil {
+			c.error(&DecodeGBKErr{err})
+		}
+		v.SetString(string(sb))
+		return
+	}
+	v.SetString(string(b))
 }
 
 type interfaceCoder struct{}
@@ -629,13 +674,6 @@ func (structCoder) typ() reflect.Kind {
 }
 
 func (sc structCoder) encode(c *codecState, v reflect.Value, _ tagOptions) {
-	if v.Kind() == reflect.Ptr {
-		if v.IsNil() {
-			return
-		}
-		v = v.Elem()
-	}
-
 	buf := make([][]byte, len(sc.fields.list))
 
 	for i := range sc.fields.list {
@@ -643,18 +681,13 @@ func (sc structCoder) encode(c *codecState, v reflect.Value, _ tagOptions) {
 		fv := v.Field(f.index)
 
 		if f.tagOptions.lengthref != "" {
-			var ref field
-			for _, i := range sc.fields.list {
-				if f.tagOptions.lengthref == i.tagOptions.lengthref {
-					ref = i
-				}
-			}
-			if ref.name == "" {
+			found, ref, refindex := sc.findref(f)
+			if !found {
 				c.error(&TagErr{fmt.Errorf("lengthref %s not fount field %s", f.name, f.tagOptions.lengthref)})
 			}
 
 			refv := v.Field(ref.index)
-			err := sc.encodeLengthref(f, ref, refv, buf)
+			err := sc.encodeLengthref(f, ref, i, refindex, refv, buf)
 			if err != nil {
 				c.error(err)
 			}
@@ -663,21 +696,23 @@ func (sc structCoder) encode(c *codecState, v reflect.Value, _ tagOptions) {
 			continue
 		}
 
-		if f.codec.typ() == reflect.String {
-			b, err := sc.encodeString(f, fv)
-			if err != nil {
-				c.error(err)
-			}
-			buf[f.index] = b
-			continue
-		}
-
 		subCodecState := newCodecState()
 		f.codec.encode(subCodecState, fv, f.tagOptions)
-		buf[f.index] = subCodecState.Bytes()
+		buf[i] = subCodecState.Bytes()
 		encodeStatePool.Put(subCodecState)
 	}
 	c.Write(bytes.Join(buf, []byte{}))
+}
+
+func (sc structCoder) findref(f field) (found bool, ref field, refindex int) {
+	for index, item := range sc.fields.list {
+		if f.tagOptions.lengthref == item.tagOptions.lengthref {
+			ref = item
+			found = true
+			refindex = index
+		}
+	}
+	return
 }
 
 func (sc structCoder) existLengthref(f field) bool {
@@ -689,7 +724,7 @@ func (sc structCoder) existLengthref(f field) bool {
 	return false
 }
 
-func (sc structCoder) encodeLengthref(lengthref, ref field, refv reflect.Value, buf [][]byte) error {
+func (sc structCoder) encodeLengthref(lengthref, ref field, lengthrefIndex, refIndex int, refv reflect.Value, buf [][]byte) error {
 	subCodecState := newCodecState()
 	ref.codec.encode(subCodecState, refv, ref.tagOptions)
 	refbytes := subCodecState.Bytes()
@@ -728,45 +763,50 @@ func (sc structCoder) encodeLengthref(lengthref, ref field, refv reflect.Value, 
 	lengthrefbytes := subCodecState.Bytes()
 	encodeStatePool.Put(subCodecState)
 
-	buf[lengthref.index] = lengthrefbytes
-	buf[ref.index] = refbytes
+	buf[lengthrefIndex] = lengthrefbytes
+	buf[refIndex] = refbytes
 	return nil
 }
 
-func (sc structCoder) encodeString(f field, v reflect.Value) ([]byte, error) {
-	str := v.String()
-
-	if f.tagOptions.bcd != 0 {
-		b, err := bcd8421.EncodeFromStr(str, f.tagOptions.bcd)
-		if err != nil {
-			return b, &EncodeBCDErr{err}
-		}
-		return b, nil
-	}
-
-	var strCodeing encoding.Encoding
-	if f.tagOptions.gbk {
-		strCodeing = simplifiedchinese.GB18030
-	}
-	if f.tagOptions.gbk18030 {
-		strCodeing = simplifiedchinese.GB18030
-	}
-	if strCodeing != nil {
-		textbyte, err := strCodeing.NewEncoder().Bytes([]byte(str))
-		if err != nil {
-			return textbyte, &EncodeGBKErr{err}
-		}
-		return textbyte, nil
-	}
-	return []byte(str), nil
-}
-
 func (sc structCoder) decode(c *codecState, v reflect.Value, _ tagOptions) {
-	if v.Kind() == reflect.Ptr {
-		if v.IsNil() {
-			return
+
+	for i := range sc.fields.list {
+		f := sc.fields.list[i]
+		if f.tagOptions.lengthref != "" {
+
+			found, _, refindex := sc.findref(f)
+			if !found {
+				c.error(&TagErr{fmt.Errorf("lengthref %s not fount field %s", f.name, f.tagOptions.lengthref)})
+			}
+			var length int
+			fv := v.Field(f.index)
+			switch f.codec.typ() {
+			case reflect.Int8:
+				fallthrough
+			case reflect.Int16:
+				fallthrough
+			case reflect.Int32:
+				fallthrough
+			case reflect.Int, reflect.Int64:
+				length = int(fv.Int())
+			case reflect.Uint8:
+				fallthrough
+			case reflect.Uint16:
+				fallthrough
+			case reflect.Uint32:
+				fallthrough
+			case reflect.Uint, reflect.Uint64, reflect.Uintptr:
+				length = int(fv.Uint())
+			case reflect.Float32:
+				fallthrough
+			case reflect.Float64:
+				length = int(fv.Float())
+			default:
+				c.error(&TagErr{fmt.Errorf("lengthref %s type %s is invalid", f.name, f.codec.typ())})
+			}
+
+			sc.fields.list[refindex].tagOptions.length = length
 		}
-		v = v.Elem()
 	}
 
 	for i := range sc.fields.list {
@@ -791,17 +831,34 @@ func (arrayCoder) typ() reflect.Kind {
 
 func (ac arrayCoder) encode(c *codecState, v reflect.Value, to tagOptions) {
 	n := v.Len()
+	pl := c.Len()
+
 	for i := 0; i < n; i++ {
 		ac.elemCodec.encode(c, v.Index(i), to)
+	}
+
+	length := c.Len() - pl
+	if to.length != 0 && length != to.length {
+		c.error(&LengthErr{fmt.Errorf("array length %d tag length %d", length, to.length)})
 	}
 }
 
 func (ac arrayCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
+	var b []byte
+	if to.length != 0 {
+		b = make([]byte, to.length)
+		c.Read(b)
+	} else {
+		b = c.Bytes()
+	}
+	subCodecState := newCodecState()
+	subCodecState.Write(b)
+
 	i := 0
 	for {
 		if i < v.Len() {
-			ac.elemCodec.decode(c, v.Index(i), to)
-			if c.Len() == 0 {
+			ac.elemCodec.decode(subCodecState, v.Index(i), to)
+			if subCodecState.Len() == 0 {
 				break
 			}
 			continue
@@ -815,6 +872,7 @@ func (ac arrayCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
 			v.Index(i).Set(z)
 		}
 	}
+	encodeStatePool.Put(subCodecState)
 }
 
 func newArrayCoder(t reflect.Type) codec {
@@ -831,12 +889,29 @@ func (sliceCoder) typ() reflect.Kind {
 
 func (sc sliceCoder) encode(c *codecState, v reflect.Value, to tagOptions) {
 	n := v.Len()
+	pl := c.Len()
+
 	for i := 0; i < n; i++ {
 		sc.elemCodec.encode(c, v.Index(i), to)
+	}
+
+	length := c.Len() - pl
+	if to.length != 0 && length != to.length {
+		c.error(&LengthErr{fmt.Errorf("slice length %d tag length %d", length, to.length)})
 	}
 }
 
 func (sc sliceCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
+	var b []byte
+	if to.length != 0 {
+		b = make([]byte, to.length)
+		c.Read(b)
+	} else {
+		b = c.Bytes()
+	}
+	subCodecState := newCodecState()
+	subCodecState.Write(b)
+
 	i := 0
 	for {
 		// Grow slice if necessary
@@ -853,8 +928,8 @@ func (sc sliceCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
 			v.SetLen(i + 1)
 		}
 
-		sc.elemCodec.decode(c, v.Index(i), to)
-		if c.Len() != 0 {
+		sc.elemCodec.decode(subCodecState, v.Index(i), to)
+		if subCodecState.Len() != 0 {
 			continue
 		}
 		break
@@ -863,6 +938,7 @@ func (sc sliceCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
 	if i == 0 {
 		v.Set(reflect.MakeSlice(v.Type(), 0, 0))
 	}
+	encodeStatePool.Put(subCodecState)
 }
 
 func newSliceCoder(t reflect.Type) codec {
@@ -896,6 +972,10 @@ func (pe ptrCoder) encode(c *codecState, v reflect.Value, to tagOptions) {
 }
 
 func (pe ptrCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
+	if v.IsNil() {
+		v.Set(reflect.New(v.Type().Elem()))
+	}
+
 	if c.ptrLevel++; c.ptrLevel > startDetectingCyclesAfter {
 		// We're a large number of nested ptrCoder.encode calls deep;
 		// start checking if we've run into a pointer cycle.
