@@ -5,6 +5,11 @@ import (
 	"testing"
 )
 
+type tmp struct {
+	l int `lengthref:s`
+	s string
+}
+
 func TestPtrCoder(t *testing.T) {
 	b := true
 	var bp *bool = &b
@@ -16,5 +21,4 @@ func TestPtrCoder(t *testing.T) {
 	fmt.Println(bytes, err)
 	bytes, err = Marshal(bpobj)
 	fmt.Println(bytes, err)
-
 }

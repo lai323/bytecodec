@@ -6,10 +6,11 @@ import (
 )
 
 type tagOptions struct {
-	length   string
-	gbk      bool
-	gbk18030 bool
-	bcd      int // TODO
+	length    int
+	lengthref string
+	gbk       bool
+	gbk18030  bool
+	bcd       int // TODO
 }
 
 func parseTag(tag string) tagOptions {
@@ -23,13 +24,22 @@ func parseTag(tag string) tagOptions {
 		settings[s[0]] = s[1]
 	}
 	to := tagOptions{}
-	to.length = settings["length"]
+
+	lengthref := settings["length"]
+	l, err := strconv.Atoi(lengthref)
+	if err != nil {
+		to.length = l
+	} else {
+		to.lengthref = lengthref
+	}
+
 	if settings["gbk"] != "" {
 		to.gbk = true
 	}
 	if settings["gbk18030"] != "" {
 		to.gbk18030 = true
 	}
+
 	bcdlength, err := strconv.Atoi(settings["bcd"])
 	if err == nil {
 		to.bcd = bcdlength

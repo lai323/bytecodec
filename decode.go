@@ -25,7 +25,8 @@ func Unmarshal(data []byte, v interface{}) error {
 		return &InvalidUnmarshalError{reflect.TypeOf(v)}
 	}
 
-	d := newCodecState(data)
+	d := newCodecState()
+	d.Write(data)
 	err := d.unmarshal(rv)
 	if err != nil {
 		return err

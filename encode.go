@@ -1,7 +1,7 @@
 package bytecodec
 
 func Marshal(v interface{}) ([]byte, error) {
-	e := newCodecState([]byte{})
+	e := newCodecState()
 
 	err := e.marshal(v)
 	if err != nil {
