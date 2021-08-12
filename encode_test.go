@@ -2,6 +2,7 @@ package bytecodec
 
 import (
 	"fmt"
+	"math"
 	"testing"
 )
 
@@ -200,5 +201,63 @@ func TestMarshal(t *testing.T) {
 	if get != want {
 		t.Errorf("Marshal pallValue = %s should be %s", get, want)
 		return
+	}
+}
+
+func TestByteCoder(t *testing.T) {
+
+}
+
+type SamePointerNoCycle struct {
+	Ptr1, Ptr2 *SamePointerNoCycle
+}
+
+var samePointerNoCycle = &SamePointerNoCycle{}
+
+type PointerCycle struct {
+	Ptr *PointerCycle
+}
+
+var pointerCycle = &PointerCycle{}
+
+type PointerCycleIndirect struct {
+	Ptrs []interface{}
+}
+
+var pointerCycleIndirect = &PointerCycleIndirect{}
+
+func init() {
+	ptr := &SamePointerNoCycle{}
+	samePointerNoCycle.Ptr1 = ptr
+	samePointerNoCycle.Ptr2 = ptr
+
+	pointerCycle.Ptr = pointerCycle
+	pointerCycleIndirect.Ptrs = []interface{}{pointerCycleIndirect}
+}
+
+// 测试了递归结构
+func TestSamePointerNoCycle(t *testing.T) {
+	if _, err := Marshal(samePointerNoCycle); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+var unsupportedValues = []interface{}{
+	math.NaN(),
+	math.Inf(-1),
+	math.Inf(1),
+	pointerCycle,
+	pointerCycleIndirect,
+}
+
+func TestUnsupportedValues(t *testing.T) {
+	for _, v := range unsupportedValues {
+		if _, err := Marshal(v); err != nil {
+			if _, ok := err.(*UnsupportedValueError); !ok {
+				t.Errorf("for %v, got %T want UnsupportedValueError", v, err)
+			}
+		} else {
+			t.Errorf("for %v, expected error", v)
+		}
 	}
 }

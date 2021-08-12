@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strconv"
 	"sync"
 
 	"github.com/lai323/bcd8421"
@@ -64,9 +65,7 @@ func (e *UnsupportedValueError) Error() string {
 	return "bytecodec: unsupported value: " + e.Str
 }
 
-type codecState struct {
-	bytes.Buffer
-
+type pointerTrack struct {
 	// Keep track of what pointers we've seen in the current recursive call
 	// path, to avoid cycles that could lead to a stack overflow. Only do
 	// the relatively expensive map operations if ptrLevel is larger than
@@ -76,21 +75,32 @@ type codecState struct {
 	ptrSeen  map[interface{}]struct{}
 }
 
+func newPointerTrack() pointerTrack {
+	return pointerTrack{ptrSeen: make(map[interface{}]struct{})}
+}
+
+type codecState struct {
+	bytes.Buffer
+	pt *pointerTrack
+}
+
 const startDetectingCyclesAfter = 1000
 
 var encodeStatePool sync.Pool
 
 func newCodecState() *codecState {
+	pt := newPointerTrack()
+	return subCodecState(&pt)
+}
+
+func subCodecState(pt *pointerTrack) *codecState {
 	if v := encodeStatePool.Get(); v != nil {
 		e := v.(*codecState)
 		e.Reset()
-		if len(e.ptrSeen) > 0 {
-			panic("ptrCoder.encode should have emptied ptrSeen via defers")
-		}
-		e.ptrLevel = 0
+		e.pt = pt
 		return e
 	}
-	return &codecState{ptrSeen: make(map[interface{}]struct{})}
+	return &codecState{pt: pt}
 }
 
 func (c *codecState) marshal(v interface{}) error {
@@ -100,6 +110,10 @@ func (c *codecState) marshal(v interface{}) error {
 
 func (c *codecState) unmarshal(v reflect.Value) error {
 	return c.code(valueCodec(v).decode, v)
+}
+
+func (c *codecState) gensub() *codecState {
+	return subCodecState(c.pt)
 }
 
 type bytecodecError struct{ error }
@@ -155,22 +169,68 @@ func valueCodec(v reflect.Value) codec {
 	return typeCodec(v.Type())
 }
 
+// func typeCodec(t reflect.Type) codec {
+// 	if fi, ok := codecCache.Load(t); ok {
+// 		return fi.(codec)
+// 	}
+// 	c := newTypeCodec(t, true)
+// 	codecCache.Store(t, c)
+// 	return c
+// }
+
+type recursiveWrapCoder struct {
+	elemCodec *codec
+	wg        *sync.WaitGroup
+}
+
+func (rw recursiveWrapCoder) typ() reflect.Kind {
+	return (*rw.elemCodec).typ()
+}
+
+func (rw recursiveWrapCoder) encode(c *codecState, v reflect.Value, to tagOptions) {
+	rw.wg.Wait()
+	(*rw.elemCodec).encode(c, v, to)
+}
+
+func (rw recursiveWrapCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
+	rw.wg.Wait()
+	(*rw.elemCodec).decode(c, v, to)
+}
+
 func typeCodec(t reflect.Type) codec {
-	if fi, ok := codecCache.Load(t); ok {
-		return fi.(codec)
+	if ci, ok := codecCache.Load(t); ok {
+		return ci.(codec)
 	}
-	c := newtypeCodec(t, true)
-	codecCache.Store(t, c)
-	return c
+
+	// To deal with recursive types, populate the map with an
+	// indirect codec before we build it. This type waits on the
+	// real codec to be ready and then calls it. This indirect
+	// codec is only used for recursive types.
+	var (
+		wg  sync.WaitGroup
+		tmp codec
+	)
+	cp := &tmp
+	wg.Add(1)
+	ci, loaded := codecCache.LoadOrStore(t, recursiveWrapCoder{cp, &wg})
+	if loaded {
+		return ci.(codec)
+	}
+
+	// Compute the real coder and replace the indirect func with it.
+	tmp = newTypeCodec(t, true)
+	wg.Done()
+	codecCache.Store(t, tmp)
+	return tmp
 }
 
 var (
 	bytecoderType = reflect.TypeOf((*ByteCoder)(nil)).Elem()
 )
 
-func newtypeCodec(t reflect.Type, allowAddr bool) codec {
+func newTypeCodec(t reflect.Type, allowAddr bool) codec {
 	if t.Kind() != reflect.Ptr && allowAddr && reflect.PtrTo(t).Implements(bytecoderType) {
-		return newCondAddrCoder(addrByteCoderCoder{}, newtypeCodec(t, false))
+		return newCondAddrCoder(addrByteCoderCoder{}, newTypeCodec(t, false))
 	}
 	if t.Implements(bytecoderType) {
 		return byteCoderCoder{}
@@ -469,7 +529,12 @@ func (float32Coder) typ() reflect.Kind {
 }
 
 func (float32Coder) encode(c *codecState, v reflect.Value, _ tagOptions) {
-	u := math.Float32bits(float32(v.Float()))
+	f := v.Float()
+	if math.IsInf(f, 0) || math.IsNaN(f) {
+		c.error(&UnsupportedValueError{v, strconv.FormatFloat(f, 'g', -1, 32)})
+	}
+
+	u := math.Float32bits(float32(f))
 	b := make([]byte, 4)
 	binary.BigEndian.PutUint32(b, u)
 	c.Write(b)
@@ -490,7 +555,12 @@ func (float64Coder) typ() reflect.Kind {
 }
 
 func (float64Coder) encode(c *codecState, v reflect.Value, _ tagOptions) {
-	u := math.Float64bits(v.Float())
+	f := v.Float()
+	if math.IsInf(f, 0) || math.IsNaN(f) {
+		c.error(&UnsupportedValueError{v, strconv.FormatFloat(f, 'g', -1, 64)})
+	}
+
+	u := math.Float64bits(f)
 	b := make([]byte, 8)
 	binary.BigEndian.PutUint64(b, u)
 	c.Write(b)
@@ -687,19 +757,20 @@ func (sc structCoder) encode(c *codecState, v reflect.Value, _ tagOptions) {
 			}
 
 			refv := v.Field(ref.index)
-			err := sc.encodeLengthref(f, ref, i, refindex, refv, buf)
+			err := sc.encodeLengthref(c, f, ref, i, refindex, refv, buf)
 			if err != nil {
 				c.error(err)
 			}
+			continue
 		}
 		if sc.existLengthref(f) {
 			continue
 		}
 
-		subCodecState := newCodecState()
-		f.codec.encode(subCodecState, fv, f.tagOptions)
-		buf[i] = subCodecState.Bytes()
-		encodeStatePool.Put(subCodecState)
+		scc := c.gensub()
+		f.codec.encode(scc, fv, f.tagOptions)
+		buf[i] = append([]byte(nil), scc.Bytes()...)
+		encodeStatePool.Put(scc)
 	}
 	c.Write(bytes.Join(buf, []byte{}))
 }
@@ -724,11 +795,11 @@ func (sc structCoder) existLengthref(f field) bool {
 	return false
 }
 
-func (sc structCoder) encodeLengthref(lengthref, ref field, lengthrefIndex, refIndex int, refv reflect.Value, buf [][]byte) error {
-	subCodecState := newCodecState()
-	ref.codec.encode(subCodecState, refv, ref.tagOptions)
-	refbytes := subCodecState.Bytes()
-	encodeStatePool.Put(subCodecState)
+func (sc structCoder) encodeLengthref(c *codecState, lengthref, ref field, lengthrefIndex, refIndex int, refv reflect.Value, buf [][]byte) error {
+	scc := c.gensub()
+	ref.codec.encode(scc, refv, ref.tagOptions)
+	refbytes := append([]byte(nil), scc.Bytes()...)
+	encodeStatePool.Put(scc)
 
 	length := len(refbytes)
 	var lengthv reflect.Value
@@ -758,10 +829,10 @@ func (sc structCoder) encodeLengthref(lengthref, ref field, lengthrefIndex, refI
 		return &TagErr{fmt.Errorf("lengthref %s type %s is invalid", lengthref.name, lengthref.codec.typ())}
 	}
 
-	subCodecState = newCodecState()
-	lengthref.codec.encode(subCodecState, lengthv, lengthref.tagOptions)
-	lengthrefbytes := subCodecState.Bytes()
-	encodeStatePool.Put(subCodecState)
+	scc = c.gensub()
+	lengthref.codec.encode(scc, lengthv, lengthref.tagOptions)
+	lengthrefbytes := append([]byte(nil), scc.Bytes()...)
+	encodeStatePool.Put(scc)
 
 	buf[lengthrefIndex] = lengthrefbytes
 	buf[refIndex] = refbytes
@@ -851,14 +922,14 @@ func (ac arrayCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
 	} else {
 		b = c.Bytes()
 	}
-	subCodecState := newCodecState()
-	subCodecState.Write(b)
+	scc := c.gensub()
+	scc.Write(b)
 
 	i := 0
 	for {
 		if i < v.Len() {
-			ac.elemCodec.decode(subCodecState, v.Index(i), to)
-			if subCodecState.Len() == 0 {
+			ac.elemCodec.decode(scc, v.Index(i), to)
+			if scc.Len() == 0 {
 				break
 			}
 			continue
@@ -872,7 +943,7 @@ func (ac arrayCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
 			v.Index(i).Set(z)
 		}
 	}
-	encodeStatePool.Put(subCodecState)
+	encodeStatePool.Put(scc)
 }
 
 func newArrayCoder(t reflect.Type) codec {
@@ -909,8 +980,8 @@ func (sc sliceCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
 	} else {
 		b = c.Bytes()
 	}
-	subCodecState := newCodecState()
-	subCodecState.Write(b)
+	scc := c.gensub()
+	scc.Write(b)
 
 	i := 0
 	for {
@@ -928,8 +999,8 @@ func (sc sliceCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
 			v.SetLen(i + 1)
 		}
 
-		sc.elemCodec.decode(subCodecState, v.Index(i), to)
-		if subCodecState.Len() != 0 {
+		sc.elemCodec.decode(scc, v.Index(i), to)
+		if scc.Len() != 0 {
 			continue
 		}
 		break
@@ -938,7 +1009,7 @@ func (sc sliceCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
 	if i == 0 {
 		v.Set(reflect.MakeSlice(v.Type(), 0, 0))
 	}
-	encodeStatePool.Put(subCodecState)
+	encodeStatePool.Put(scc)
 }
 
 func newSliceCoder(t reflect.Type) codec {
@@ -957,18 +1028,18 @@ func (pe ptrCoder) encode(c *codecState, v reflect.Value, to tagOptions) {
 	if v.IsNil() {
 		return
 	}
-	if c.ptrLevel++; c.ptrLevel > startDetectingCyclesAfter {
+	if c.pt.ptrLevel++; c.pt.ptrLevel > startDetectingCyclesAfter {
 		// We're a large number of nested ptrCoder.encode calls deep;
 		// start checking if we've run into a pointer cycle.
 		ptr := v.Interface()
-		if _, ok := c.ptrSeen[ptr]; ok {
+		if _, ok := c.pt.ptrSeen[ptr]; ok {
 			c.error(&UnsupportedValueError{v, fmt.Sprintf("encountered a cycle via %s", v.Type())})
 		}
-		c.ptrSeen[ptr] = struct{}{}
-		defer delete(c.ptrSeen, ptr)
+		c.pt.ptrSeen[ptr] = struct{}{}
+		defer delete(c.pt.ptrSeen, ptr)
 	}
 	pe.elemCodec.encode(c, v.Elem(), to)
-	c.ptrLevel--
+	c.pt.ptrLevel--
 }
 
 func (pe ptrCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
@@ -976,18 +1047,18 @@ func (pe ptrCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
 		v.Set(reflect.New(v.Type().Elem()))
 	}
 
-	if c.ptrLevel++; c.ptrLevel > startDetectingCyclesAfter {
+	if c.pt.ptrLevel++; c.pt.ptrLevel > startDetectingCyclesAfter {
 		// We're a large number of nested ptrCoder.encode calls deep;
 		// start checking if we've run into a pointer cycle.
 		ptr := v.Interface()
-		if _, ok := c.ptrSeen[ptr]; ok {
+		if _, ok := c.pt.ptrSeen[ptr]; ok {
 			c.error(&UnsupportedValueError{v, fmt.Sprintf("encountered a cycle via %s", v.Type())})
 		}
-		c.ptrSeen[ptr] = struct{}{}
-		defer delete(c.ptrSeen, ptr)
+		c.pt.ptrSeen[ptr] = struct{}{}
+		defer delete(c.pt.ptrSeen, ptr)
 	}
 	pe.elemCodec.decode(c, v.Elem(), to)
-	c.ptrLevel--
+	c.pt.ptrLevel--
 }
 
 func newPtrCoder(t reflect.Type) codec {
