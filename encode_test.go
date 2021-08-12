@@ -3,6 +3,7 @@ package bytecodec
 import (
 	"fmt"
 	"math"
+	"reflect"
 	"testing"
 )
 
@@ -204,8 +205,59 @@ func TestMarshal(t *testing.T) {
 	}
 }
 
-func TestByteCoder(t *testing.T) {
+type simpleByteCoder struct {
+	s string
+}
 
+func (bc simpleByteCoder) MarshalBytes(cs *CodecState) error {
+	for _, b := range []byte(bc.s) {
+		cs.WriteByte(b + 1)
+	}
+	return nil
+}
+func (bc *simpleByteCoder) UnmarshalBytes(cs *CodecState) error {
+	var sb []byte
+	for _, b := range cs.Bytes() {
+		sb = append(sb, b-1)
+	}
+	bc.s = string(sb)
+	return nil
+}
+
+var byteCoderTests = []struct {
+	b   []byte
+	v   interface{}
+	ptr interface{}
+}{{
+	[]byte{231, 182, 140, 233, 176, 150},
+	&simpleByteCoder{"测试"},
+	&simpleByteCoder{""},
+}, {
+	[]byte{117, 102, 116, 117},
+	&simpleByteCoder{"test"},
+	&simpleByteCoder{""},
+}}
+
+func TestByteCoder(t *testing.T) {
+	for _, tt := range byteCoderTests {
+		b, err := Marshal(tt.v)
+		if err != nil {
+			t.Errorf("Marshal %#v, unexpected error: %#v", tt.v, err)
+			continue
+		}
+		if !reflect.DeepEqual(tt.b, b) {
+			t.Errorf("Marshal %#v = %#v, want %#v", tt.v, b, tt.b)
+		}
+
+		err = Unmarshal(tt.b, tt.ptr)
+		if err != nil {
+			t.Errorf("Unmarshal %#v, unexpected error: %#v", tt.b, err)
+			continue
+		}
+		if !reflect.DeepEqual(tt.ptr, tt.v) {
+			t.Errorf("Unmarshal %#v = %#v, want %#v", tt.b, tt.ptr, tt.v)
+		}
+	}
 }
 
 type SamePointerNoCycle struct {

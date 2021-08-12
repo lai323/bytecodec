@@ -16,8 +16,8 @@ import (
 )
 
 type ByteCoder interface {
-	MarshalBytes() ([]byte, error)
-	UnmarshalBytes(*bytes.Buffer) error
+	MarshalBytes(*CodecState) error
+	UnmarshalBytes(*CodecState) error
 }
 
 // A MarshalerError represents an error from calling a MarshalBytes method.
@@ -79,7 +79,7 @@ func newPointerTrack() pointerTrack {
 	return pointerTrack{ptrSeen: make(map[interface{}]struct{})}
 }
 
-type codecState struct {
+type CodecState struct {
 	bytes.Buffer
 	pt *pointerTrack
 }
@@ -88,37 +88,37 @@ const startDetectingCyclesAfter = 1000
 
 var encodeStatePool sync.Pool
 
-func newCodecState() *codecState {
+func newCodecState() *CodecState {
 	pt := newPointerTrack()
 	return subCodecState(&pt)
 }
 
-func subCodecState(pt *pointerTrack) *codecState {
+func subCodecState(pt *pointerTrack) *CodecState {
 	if v := encodeStatePool.Get(); v != nil {
-		e := v.(*codecState)
+		e := v.(*CodecState)
 		e.Reset()
 		e.pt = pt
 		return e
 	}
-	return &codecState{pt: pt}
+	return &CodecState{pt: pt}
 }
 
-func (c *codecState) marshal(v interface{}) error {
+func (c *CodecState) marshal(v interface{}) error {
 	vv := reflect.ValueOf(v)
 	return c.code(valueCodec(vv).encode, vv)
 }
 
-func (c *codecState) unmarshal(v reflect.Value) error {
+func (c *CodecState) unmarshal(v reflect.Value) error {
 	return c.code(valueCodec(v).decode, v)
 }
 
-func (c *codecState) gensub() *codecState {
+func (c *CodecState) gensub() *CodecState {
 	return subCodecState(c.pt)
 }
 
 type bytecodecError struct{ error }
 
-func (c *codecState) code(f func(e *codecState, v reflect.Value, to tagOptions), v reflect.Value) (err error) {
+func (c *CodecState) code(f func(e *CodecState, v reflect.Value, to tagOptions), v reflect.Value) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			if be, ok := r.(bytecodecError); ok {
@@ -132,21 +132,13 @@ func (c *codecState) code(f func(e *codecState, v reflect.Value, to tagOptions),
 	return nil
 }
 
-func (c *codecState) error(err error) {
+func (c *CodecState) error(err error) {
 	panic(bytecodecError{err})
 }
 
 var DataLengthErr = errors.New("Not enough data length")
 
-func (c *codecState) ReadByte() byte {
-	b, err := c.Buffer.ReadByte()
-	if err != nil {
-		c.error(bytecodecError{DataLengthErr})
-	}
-	return b
-}
-
-func (c *codecState) Read(p []byte) int {
+func (c *CodecState) Read(p []byte) int {
 	n, err := c.Buffer.Read(p)
 	if err != nil {
 		c.error(bytecodecError{DataLengthErr})
@@ -154,9 +146,17 @@ func (c *codecState) Read(p []byte) int {
 	return n
 }
 
+func (c *CodecState) ReadByte() byte {
+	b, err := c.Buffer.ReadByte()
+	if err != nil {
+		c.error(bytecodecError{DataLengthErr})
+	}
+	return b
+}
+
 type codec interface {
-	encode(e *codecState, v reflect.Value, to tagOptions)
-	decode(e *codecState, v reflect.Value, to tagOptions)
+	encode(e *CodecState, v reflect.Value, to tagOptions)
+	decode(e *CodecState, v reflect.Value, to tagOptions)
 	typ() reflect.Kind
 }
 
@@ -187,12 +187,12 @@ func (rw recursiveWrapCoder) typ() reflect.Kind {
 	return (*rw.elemCodec).typ()
 }
 
-func (rw recursiveWrapCoder) encode(c *codecState, v reflect.Value, to tagOptions) {
+func (rw recursiveWrapCoder) encode(c *CodecState, v reflect.Value, to tagOptions) {
 	rw.wg.Wait()
 	(*rw.elemCodec).encode(c, v, to)
 }
 
-func (rw recursiveWrapCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
+func (rw recursiveWrapCoder) decode(c *CodecState, v reflect.Value, to tagOptions) {
 	rw.wg.Wait()
 	(*rw.elemCodec).decode(c, v, to)
 }
@@ -286,10 +286,10 @@ func (invalidValueCoder) typ() reflect.Kind {
 	return reflect.Invalid
 }
 
-func (invalidValueCoder) encode(c *codecState, v reflect.Value, _ tagOptions) {
+func (invalidValueCoder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 }
 
-func (invalidValueCoder) decode(c *codecState, v reflect.Value, _ tagOptions) {
+func (invalidValueCoder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 }
 
 type byteCoderCoder struct{}
@@ -298,24 +298,23 @@ func (byteCoderCoder) typ() reflect.Kind {
 	return reflect.Invalid
 }
 
-func (byteCoderCoder) encode(c *codecState, v reflect.Value, _ tagOptions) {
+func (byteCoderCoder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 	m, ok := v.Interface().(ByteCoder)
 	if !ok {
 		return
 	}
-	b, err := m.MarshalBytes()
+	err := m.MarshalBytes(c)
 	if err != nil {
 		c.error(&MarshalerError{v.Type(), err})
 	}
-	c.Write(b)
 }
 
-func (byteCoderCoder) decode(c *codecState, v reflect.Value, _ tagOptions) {
+func (byteCoderCoder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	m, ok := v.Interface().(ByteCoder)
 	if !ok {
 		return
 	}
-	err := m.UnmarshalBytes(&c.Buffer)
+	err := m.UnmarshalBytes(c)
 	if err != nil {
 		c.error(&UnmarshalerError{v.Type(), err})
 	}
@@ -327,26 +326,25 @@ func (addrByteCoderCoder) typ() reflect.Kind {
 	return reflect.Invalid
 }
 
-func (addrByteCoderCoder) encode(c *codecState, v reflect.Value, _ tagOptions) {
+func (addrByteCoderCoder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 	va := v.Addr()
 	if va.IsNil() {
 		return
 	}
 	m := va.Interface().(ByteCoder)
-	b, err := m.MarshalBytes()
+	err := m.MarshalBytes(c)
 	if err != nil {
 		c.error(&MarshalerError{v.Type(), err})
 	}
-	c.Write(b)
 }
 
-func (addrByteCoderCoder) decode(c *codecState, v reflect.Value, _ tagOptions) {
+func (addrByteCoderCoder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	va := v.Addr()
 	if va.IsNil() {
 		return
 	}
 	m := va.Interface().(ByteCoder)
-	err := m.UnmarshalBytes(&c.Buffer)
+	err := m.UnmarshalBytes(c)
 	if err != nil {
 		c.error(&UnmarshalerError{v.Type(), err})
 	}
@@ -358,7 +356,7 @@ func (boolCoder) typ() reflect.Kind {
 	return reflect.Bool
 }
 
-func (boolCoder) encode(c *codecState, v reflect.Value, _ tagOptions) {
+func (boolCoder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 	if v.Bool() {
 		c.WriteByte(1)
 	} else {
@@ -366,7 +364,7 @@ func (boolCoder) encode(c *codecState, v reflect.Value, _ tagOptions) {
 	}
 }
 
-func (boolCoder) decode(c *codecState, v reflect.Value, _ tagOptions) {
+func (boolCoder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	if c.ReadByte() == 0 {
 		v.SetBool(false)
 	} else {
@@ -380,11 +378,11 @@ func (int8Coder) typ() reflect.Kind {
 	return reflect.Int8
 }
 
-func (int8Coder) encode(c *codecState, v reflect.Value, _ tagOptions) {
+func (int8Coder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 	c.WriteByte(byte(v.Int()))
 }
 
-func (int8Coder) decode(c *codecState, v reflect.Value, _ tagOptions) {
+func (int8Coder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	v.SetInt(int64(int8(c.ReadByte())))
 }
 
@@ -394,14 +392,14 @@ func (int16Coder) typ() reflect.Kind {
 	return reflect.Int16
 }
 
-func (int16Coder) encode(c *codecState, v reflect.Value, _ tagOptions) {
+func (int16Coder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 	i := v.Int()
 	b := make([]byte, 2)
 	binary.BigEndian.PutUint16(b, uint16(i))
 	c.Write(b)
 }
 
-func (int16Coder) decode(c *codecState, v reflect.Value, _ tagOptions) {
+func (int16Coder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	b := make([]byte, 2)
 	c.Read(b)
 	i := binary.BigEndian.Uint16(b)
@@ -414,14 +412,14 @@ func (int32Coder) typ() reflect.Kind {
 	return reflect.Int32
 }
 
-func (int32Coder) encode(c *codecState, v reflect.Value, _ tagOptions) {
+func (int32Coder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 	i := v.Int()
 	b := make([]byte, 4)
 	binary.BigEndian.PutUint32(b, uint32(i))
 	c.Write(b)
 }
 
-func (int32Coder) decode(c *codecState, v reflect.Value, _ tagOptions) {
+func (int32Coder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	b := make([]byte, 4)
 	c.Read(b)
 	i := binary.BigEndian.Uint32(b)
@@ -434,14 +432,14 @@ func (int64Coder) typ() reflect.Kind {
 	return reflect.Int64
 }
 
-func (int64Coder) encode(c *codecState, v reflect.Value, _ tagOptions) {
+func (int64Coder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 	i := v.Int()
 	b := make([]byte, 8)
 	binary.BigEndian.PutUint64(b, uint64(i))
 	c.Write(b)
 }
 
-func (int64Coder) decode(c *codecState, v reflect.Value, _ tagOptions) {
+func (int64Coder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	b := make([]byte, 8)
 	c.Read(b)
 	i := binary.BigEndian.Uint64(b)
@@ -454,11 +452,11 @@ func (uint8Coder) typ() reflect.Kind {
 	return reflect.Uint8
 }
 
-func (uint8Coder) encode(c *codecState, v reflect.Value, _ tagOptions) {
+func (uint8Coder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 	c.WriteByte(byte(v.Uint()))
 }
 
-func (uint8Coder) decode(c *codecState, v reflect.Value, _ tagOptions) {
+func (uint8Coder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	v.SetUint(uint64(c.ReadByte()))
 }
 
@@ -468,14 +466,14 @@ func (uint16Coder) typ() reflect.Kind {
 	return reflect.Uint16
 }
 
-func (uint16Coder) encode(c *codecState, v reflect.Value, _ tagOptions) {
+func (uint16Coder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 	u := v.Uint()
 	b := make([]byte, 2)
 	binary.BigEndian.PutUint16(b, uint16(u))
 	c.Write(b)
 }
 
-func (uint16Coder) decode(c *codecState, v reflect.Value, _ tagOptions) {
+func (uint16Coder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	b := make([]byte, 2)
 	c.Read(b)
 	u := binary.BigEndian.Uint16(b)
@@ -488,14 +486,14 @@ func (uint32Coder) typ() reflect.Kind {
 	return reflect.Uint32
 }
 
-func (uint32Coder) encode(c *codecState, v reflect.Value, _ tagOptions) {
+func (uint32Coder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 	u := v.Uint()
 	b := make([]byte, 4)
 	binary.BigEndian.PutUint32(b, uint32(u))
 	c.Write(b)
 }
 
-func (uint32Coder) decode(c *codecState, v reflect.Value, _ tagOptions) {
+func (uint32Coder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	b := make([]byte, 4)
 	c.Read(b)
 	u := binary.BigEndian.Uint32(b)
@@ -508,14 +506,14 @@ func (uint64Coder) typ() reflect.Kind {
 	return reflect.Uint64
 }
 
-func (uint64Coder) encode(c *codecState, v reflect.Value, _ tagOptions) {
+func (uint64Coder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 	u := v.Uint()
 	b := make([]byte, 8)
 	binary.BigEndian.PutUint64(b, u)
 	c.Write(b)
 }
 
-func (uint64Coder) decode(c *codecState, v reflect.Value, _ tagOptions) {
+func (uint64Coder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	b := make([]byte, 8)
 	c.Read(b)
 	u := binary.BigEndian.Uint64(b)
@@ -528,7 +526,7 @@ func (float32Coder) typ() reflect.Kind {
 	return reflect.Float32
 }
 
-func (float32Coder) encode(c *codecState, v reflect.Value, _ tagOptions) {
+func (float32Coder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 	f := v.Float()
 	if math.IsInf(f, 0) || math.IsNaN(f) {
 		c.error(&UnsupportedValueError{v, strconv.FormatFloat(f, 'g', -1, 32)})
@@ -540,7 +538,7 @@ func (float32Coder) encode(c *codecState, v reflect.Value, _ tagOptions) {
 	c.Write(b)
 }
 
-func (float32Coder) decode(c *codecState, v reflect.Value, _ tagOptions) {
+func (float32Coder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	b := make([]byte, 4)
 	c.Read(b)
 	u := binary.BigEndian.Uint32(b)
@@ -554,7 +552,7 @@ func (float64Coder) typ() reflect.Kind {
 	return reflect.Float64
 }
 
-func (float64Coder) encode(c *codecState, v reflect.Value, _ tagOptions) {
+func (float64Coder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 	f := v.Float()
 	if math.IsInf(f, 0) || math.IsNaN(f) {
 		c.error(&UnsupportedValueError{v, strconv.FormatFloat(f, 'g', -1, 64)})
@@ -566,7 +564,7 @@ func (float64Coder) encode(c *codecState, v reflect.Value, _ tagOptions) {
 	c.Write(b)
 }
 
-func (float64Coder) decode(c *codecState, v reflect.Value, _ tagOptions) {
+func (float64Coder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	b := make([]byte, 8)
 	c.Read(b)
 	u := binary.BigEndian.Uint64(b)
@@ -617,7 +615,7 @@ func (stringCoder) typ() reflect.Kind {
 	return reflect.String
 }
 
-func (sc stringCoder) encode(c *codecState, v reflect.Value, to tagOptions) {
+func (sc stringCoder) encode(c *CodecState, v reflect.Value, to tagOptions) {
 	str := v.String()
 	var length int
 
@@ -652,7 +650,7 @@ func (sc stringCoder) encode(c *codecState, v reflect.Value, to tagOptions) {
 	}
 }
 
-func (sc stringCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
+func (sc stringCoder) decode(c *CodecState, v reflect.Value, to tagOptions) {
 	var b []byte
 	if to.length != 0 {
 		b = make([]byte, to.length)
@@ -694,7 +692,7 @@ func (interfaceCoder) typ() reflect.Kind {
 	return reflect.Interface
 }
 
-func (interfaceCoder) encode(c *codecState, v reflect.Value, to tagOptions) {
+func (interfaceCoder) encode(c *CodecState, v reflect.Value, to tagOptions) {
 	if v.IsNil() {
 		return
 	}
@@ -702,7 +700,7 @@ func (interfaceCoder) encode(c *codecState, v reflect.Value, to tagOptions) {
 	valueCodec(e).encode(c, e, to)
 }
 
-func (interfaceCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
+func (interfaceCoder) decode(c *CodecState, v reflect.Value, to tagOptions) {
 	if v.IsNil() {
 		return
 	}
@@ -716,11 +714,11 @@ func (unsupportedTypeCoder) typ() reflect.Kind {
 	return reflect.Invalid
 }
 
-func (unsupportedTypeCoder) encode(c *codecState, v reflect.Value, _ tagOptions) {
+func (unsupportedTypeCoder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 	c.error(&UnsupportedTypeError{v.Type()})
 }
 
-func (unsupportedTypeCoder) decode(c *codecState, v reflect.Value, _ tagOptions) {
+func (unsupportedTypeCoder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	c.error(&UnsupportedTypeError{v.Type()})
 }
 
@@ -743,7 +741,7 @@ func (structCoder) typ() reflect.Kind {
 	return reflect.Struct
 }
 
-func (sc structCoder) encode(c *codecState, v reflect.Value, _ tagOptions) {
+func (sc structCoder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 	buf := make([][]byte, len(sc.fields.list))
 
 	for i := range sc.fields.list {
@@ -795,7 +793,7 @@ func (sc structCoder) existLengthref(f field) bool {
 	return false
 }
 
-func (sc structCoder) encodeLengthref(c *codecState, lengthref, ref field, lengthrefIndex, refIndex int, refv reflect.Value, buf [][]byte) error {
+func (sc structCoder) encodeLengthref(c *CodecState, lengthref, ref field, lengthrefIndex, refIndex int, refv reflect.Value, buf [][]byte) error {
 	scc := c.gensub()
 	ref.codec.encode(scc, refv, ref.tagOptions)
 	refbytes := append([]byte(nil), scc.Bytes()...)
@@ -839,7 +837,7 @@ func (sc structCoder) encodeLengthref(c *codecState, lengthref, ref field, lengt
 	return nil
 }
 
-func (sc structCoder) decode(c *codecState, v reflect.Value, _ tagOptions) {
+func (sc structCoder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 
 	for i := range sc.fields.list {
 		f := sc.fields.list[i]
@@ -900,7 +898,7 @@ func (arrayCoder) typ() reflect.Kind {
 	return reflect.Array
 }
 
-func (ac arrayCoder) encode(c *codecState, v reflect.Value, to tagOptions) {
+func (ac arrayCoder) encode(c *CodecState, v reflect.Value, to tagOptions) {
 	n := v.Len()
 	pl := c.Len()
 
@@ -914,7 +912,7 @@ func (ac arrayCoder) encode(c *codecState, v reflect.Value, to tagOptions) {
 	}
 }
 
-func (ac arrayCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
+func (ac arrayCoder) decode(c *CodecState, v reflect.Value, to tagOptions) {
 	var b []byte
 	if to.length != 0 {
 		b = make([]byte, to.length)
@@ -958,7 +956,7 @@ func (sliceCoder) typ() reflect.Kind {
 	return reflect.Slice
 }
 
-func (sc sliceCoder) encode(c *codecState, v reflect.Value, to tagOptions) {
+func (sc sliceCoder) encode(c *CodecState, v reflect.Value, to tagOptions) {
 	n := v.Len()
 	pl := c.Len()
 
@@ -972,7 +970,7 @@ func (sc sliceCoder) encode(c *codecState, v reflect.Value, to tagOptions) {
 	}
 }
 
-func (sc sliceCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
+func (sc sliceCoder) decode(c *CodecState, v reflect.Value, to tagOptions) {
 	var b []byte
 	if to.length != 0 {
 		b = make([]byte, to.length)
@@ -1024,7 +1022,7 @@ func (ptrCoder) typ() reflect.Kind {
 	return reflect.Ptr
 }
 
-func (pe ptrCoder) encode(c *codecState, v reflect.Value, to tagOptions) {
+func (pe ptrCoder) encode(c *CodecState, v reflect.Value, to tagOptions) {
 	if v.IsNil() {
 		return
 	}
@@ -1042,7 +1040,7 @@ func (pe ptrCoder) encode(c *codecState, v reflect.Value, to tagOptions) {
 	c.pt.ptrLevel--
 }
 
-func (pe ptrCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
+func (pe ptrCoder) decode(c *CodecState, v reflect.Value, to tagOptions) {
 	if v.IsNil() {
 		v.Set(reflect.New(v.Type().Elem()))
 	}
@@ -1073,7 +1071,7 @@ func (condAddrCoder) typ() reflect.Kind {
 	return reflect.Invalid
 }
 
-func (ce condAddrCoder) encode(c *codecState, v reflect.Value, to tagOptions) {
+func (ce condAddrCoder) encode(c *CodecState, v reflect.Value, to tagOptions) {
 	if v.CanAddr() {
 		ce.canAddrC.encode(c, v, to)
 	} else {
@@ -1081,7 +1079,7 @@ func (ce condAddrCoder) encode(c *codecState, v reflect.Value, to tagOptions) {
 	}
 }
 
-func (ce condAddrCoder) decode(c *codecState, v reflect.Value, to tagOptions) {
+func (ce condAddrCoder) decode(c *CodecState, v reflect.Value, to tagOptions) {
 	if v.CanAddr() {
 		ce.canAddrC.decode(c, v, to)
 	} else {
