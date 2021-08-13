@@ -136,20 +136,19 @@ func (c *CodecState) error(err error) {
 	panic(bytecodecError{err})
 }
 
-var DataLengthErr = errors.New("Not enough data length")
+var ErrShortData = errors.New("short data")
 
-func (c *CodecState) Read(p []byte) int {
+func (c *CodecState) ReadFull(p []byte) {
 	n, err := c.Buffer.Read(p)
-	if err != nil {
-		c.error(bytecodecError{DataLengthErr})
+	if err != nil || n != len(p) {
+		c.error(bytecodecError{ErrShortData})
 	}
-	return n
 }
 
 func (c *CodecState) ReadByte() byte {
 	b, err := c.Buffer.ReadByte()
 	if err != nil {
-		c.error(bytecodecError{DataLengthErr})
+		c.error(bytecodecError{ErrShortData})
 	}
 	return b
 }
@@ -401,7 +400,7 @@ func (int16Coder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 
 func (int16Coder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	b := make([]byte, 2)
-	c.Read(b)
+	c.ReadFull(b)
 	i := binary.BigEndian.Uint16(b)
 	v.SetInt(int64(int16(i)))
 }
@@ -421,7 +420,7 @@ func (int32Coder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 
 func (int32Coder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	b := make([]byte, 4)
-	c.Read(b)
+	c.ReadFull(b)
 	i := binary.BigEndian.Uint32(b)
 	v.SetInt(int64(int32(i)))
 }
@@ -441,7 +440,7 @@ func (int64Coder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 
 func (int64Coder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	b := make([]byte, 8)
-	c.Read(b)
+	c.ReadFull(b)
 	i := binary.BigEndian.Uint64(b)
 	v.SetInt(int64(i))
 }
@@ -475,7 +474,7 @@ func (uint16Coder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 
 func (uint16Coder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	b := make([]byte, 2)
-	c.Read(b)
+	c.ReadFull(b)
 	u := binary.BigEndian.Uint16(b)
 	v.SetUint(uint64(u))
 }
@@ -495,7 +494,7 @@ func (uint32Coder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 
 func (uint32Coder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	b := make([]byte, 4)
-	c.Read(b)
+	c.ReadFull(b)
 	u := binary.BigEndian.Uint32(b)
 	v.SetUint(uint64(u))
 }
@@ -515,7 +514,7 @@ func (uint64Coder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 
 func (uint64Coder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	b := make([]byte, 8)
-	c.Read(b)
+	c.ReadFull(b)
 	u := binary.BigEndian.Uint64(b)
 	v.SetUint(u)
 }
@@ -540,7 +539,7 @@ func (float32Coder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 
 func (float32Coder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	b := make([]byte, 4)
-	c.Read(b)
+	c.ReadFull(b)
 	u := binary.BigEndian.Uint32(b)
 	f := math.Float32frombits(u)
 	v.SetFloat(float64(f))
@@ -566,7 +565,7 @@ func (float64Coder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 
 func (float64Coder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 	b := make([]byte, 8)
-	c.Read(b)
+	c.ReadFull(b)
 	u := binary.BigEndian.Uint64(b)
 	f := math.Float64frombits(u)
 	v.SetFloat(f)
@@ -575,37 +574,37 @@ func (float64Coder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 type DecodeGBKErr struct{ error }
 
 func (e *DecodeGBKErr) Error() string {
-	return "bytecodec DecodeGBKErr: " + e.Error()
+	return "bytecodec DecodeGBKErr: " + e.error.Error()
 }
 
 type EncodeGBKErr struct{ error }
 
 func (e *EncodeGBKErr) Error() string {
-	return "bytecodec EncodeGBKErr: " + e.Error()
+	return "bytecodec EncodeGBKErr: " + e.error.Error()
 }
 
 type EncodeBCDErr struct{ error }
 
 func (e *EncodeBCDErr) Error() string {
-	return "bytecodec EncodeBCDErr: " + e.Error()
+	return "bytecodec EncodeBCDErr: " + e.error.Error()
 }
 
 type DecodeBCDErr struct{ error }
 
 func (e *DecodeBCDErr) Error() string {
-	return "bytecodec DecodeBCDErr: " + e.Error()
+	return "bytecodec DecodeBCDErr: " + e.error.Error()
 }
 
 type TagErr struct{ error }
 
 func (e *TagErr) Error() string {
-	return "bytecodec TagErr: " + e.Error()
+	return "bytecodec TagErr: " + e.error.Error()
 }
 
 type LengthErr struct{ error }
 
 func (e *LengthErr) Error() string {
-	return "bytecodec LengthErr: " + e.Error()
+	return "bytecodec LengthErr: " + e.error.Error()
 }
 
 type stringCoder struct {
@@ -615,16 +614,22 @@ func (stringCoder) typ() reflect.Kind {
 	return reflect.String
 }
 
+func (stringCoder) checklength(c *CodecState, taglengt, length int) {
+	if taglengt > 0 && length != taglengt {
+		c.error(&LengthErr{fmt.Errorf("string length %d tag length %d", length, taglengt)})
+	}
+}
+
 func (sc stringCoder) encode(c *CodecState, v reflect.Value, to tagOptions) {
 	str := v.String()
-	var length int
 
-	if to.bcd != 0 {
-		b, err := bcd8421.EncodeFromStr(str, to.bcd)
+	if to.bcd8421 != 0 {
+		b, err := bcd8421.EncodeFromStr(str, to.bcd8421)
 		if err != nil {
 			c.error(&EncodeBCDErr{err})
 		}
-		length, _ = c.Write(b)
+		length, _ := c.Write(b)
+		sc.checklength(c, to.length, length)
 		return
 	}
 
@@ -640,26 +645,30 @@ func (sc stringCoder) encode(c *CodecState, v reflect.Value, to tagOptions) {
 		if err != nil {
 			c.error(&EncodeGBKErr{err})
 		}
-		length, _ = c.Write(b)
+		length, _ := c.Write(b)
+		sc.checklength(c, to.length, length)
 		return
 	}
-
-	length, _ = c.Write([]byte(str))
-	if to.length != 0 && length != to.length {
-		c.error(&LengthErr{fmt.Errorf("string length %d tag length %d", length, to.length)})
-	}
+	length, _ := c.Write([]byte(str))
+	sc.checklength(c, to.length, length)
+	return
 }
 
 func (sc stringCoder) decode(c *CodecState, v reflect.Value, to tagOptions) {
-	var b []byte
-	if to.length != 0 {
-		b = make([]byte, to.length)
-		c.Read(b)
-	} else {
-		b = c.Bytes()
+	if to.length == 0 {
+		return
 	}
 
-	if to.bcd != 0 {
+	var b []byte
+	if to.length > 0 {
+		b = make([]byte, to.length)
+		c.ReadFull(b)
+	} else {
+		b = make([]byte, c.Len())
+		c.ReadFull(b)
+	}
+
+	if to.bcd8421 != 0 {
 		sb, err := bcd8421.DecodeToStr(b)
 		if err != nil {
 			c.error(&DecodeBCDErr{err})
@@ -775,7 +784,7 @@ func (sc structCoder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 
 func (sc structCoder) findref(f field) (found bool, ref field, refindex int) {
 	for index, item := range sc.fields.list {
-		if f.tagOptions.lengthref == item.tagOptions.lengthref {
+		if f.tagOptions.lengthref == item.name {
 			ref = item
 			found = true
 			refindex = index
@@ -824,7 +833,7 @@ func (sc structCoder) encodeLengthref(c *CodecState, lengthref, ref field, lengt
 	case reflect.Float64:
 		lengthv = reflect.ValueOf(float64(length))
 	default:
-		return &TagErr{fmt.Errorf("lengthref %s type %s is invalid", lengthref.name, lengthref.codec.typ())}
+		return &TagErr{fmt.Errorf("lengthref %s type %q is invalid", lengthref.name, lengthref.codec.typ())}
 	}
 
 	scc = c.gensub()
@@ -847,8 +856,10 @@ func (sc structCoder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 			if !found {
 				c.error(&TagErr{fmt.Errorf("lengthref %s not fount field %s", f.name, f.tagOptions.lengthref)})
 			}
-			var length int
 			fv := v.Field(f.index)
+			f.codec.decode(c, fv, f.tagOptions)
+
+			var length int
 			switch f.codec.typ() {
 			case reflect.Int8:
 				fallthrough
@@ -871,7 +882,7 @@ func (sc structCoder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 			case reflect.Float64:
 				length = int(fv.Float())
 			default:
-				c.error(&TagErr{fmt.Errorf("lengthref %s type %s is invalid", f.name, f.codec.typ())})
+				c.error(&TagErr{fmt.Errorf("lengthref %s type %q is invalid", f.name, f.codec.typ())})
 			}
 
 			sc.fields.list[refindex].tagOptions.length = length
@@ -880,6 +891,9 @@ func (sc structCoder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 
 	for i := range sc.fields.list {
 		f := &sc.fields.list[i]
+		if f.tagOptions.lengthref != "" {
+			continue
+		}
 		fv := v.Field(f.index)
 		f.codec.decode(c, fv, f.tagOptions)
 	}
@@ -907,32 +921,37 @@ func (ac arrayCoder) encode(c *CodecState, v reflect.Value, to tagOptions) {
 	}
 
 	length := c.Len() - pl
-	if to.length != 0 && length != to.length {
+	if to.length > 0 && length != to.length {
 		c.error(&LengthErr{fmt.Errorf("array length %d tag length %d", length, to.length)})
 	}
 }
 
 func (ac arrayCoder) decode(c *CodecState, v reflect.Value, to tagOptions) {
+	if to.length == 0 {
+		return
+	}
+
 	var b []byte
-	if to.length != 0 {
+	if to.length > 0 {
 		b = make([]byte, to.length)
-		c.Read(b)
+		c.ReadFull(b)
 	} else {
-		b = c.Bytes()
+		b = make([]byte, c.Len())
+		c.ReadFull(b)
 	}
 	scc := c.gensub()
 	scc.Write(b)
 
 	i := 0
 	for {
-		if i < v.Len() {
-			ac.elemCodec.decode(scc, v.Index(i), to)
-			if scc.Len() == 0 {
-				break
-			}
-			continue
+		if i >= v.Len() {
+			break
 		}
-		break
+		ac.elemCodec.decode(scc, v.Index(i), to)
+		if scc.Len() == 0 {
+			break
+		}
+		i++
 	}
 
 	if i < v.Len() {
@@ -965,18 +984,23 @@ func (sc sliceCoder) encode(c *CodecState, v reflect.Value, to tagOptions) {
 	}
 
 	length := c.Len() - pl
-	if to.length != 0 && length != to.length {
+	if to.length > 0 && length != to.length {
 		c.error(&LengthErr{fmt.Errorf("slice length %d tag length %d", length, to.length)})
 	}
 }
 
 func (sc sliceCoder) decode(c *CodecState, v reflect.Value, to tagOptions) {
+	if to.length == 0 {
+		return
+	}
+
 	var b []byte
-	if to.length != 0 {
+	if to.length > 0 {
 		b = make([]byte, to.length)
-		c.Read(b)
+		c.ReadFull(b)
 	} else {
-		b = c.Bytes()
+		b = make([]byte, c.Len())
+		c.ReadFull(b)
 	}
 	scc := c.gensub()
 	scc.Write(b)
@@ -998,10 +1022,10 @@ func (sc sliceCoder) decode(c *CodecState, v reflect.Value, to tagOptions) {
 		}
 
 		sc.elemCodec.decode(scc, v.Index(i), to)
-		if scc.Len() != 0 {
-			continue
+		if scc.Len() == 0 {
+			break
 		}
-		break
+		i++
 	}
 
 	if i == 0 {
@@ -1042,7 +1066,8 @@ func (pe ptrCoder) encode(c *CodecState, v reflect.Value, to tagOptions) {
 
 func (pe ptrCoder) decode(c *CodecState, v reflect.Value, to tagOptions) {
 	if v.IsNil() {
-		v.Set(reflect.New(v.Type().Elem()))
+		// v.Set(reflect.New(v.Type().Elem()))
+		return
 	}
 
 	if c.pt.ptrLevel++; c.pt.ptrLevel > startDetectingCyclesAfter {
@@ -1103,7 +1128,7 @@ func typeFields(t reflect.Type) structFields {
 			continue
 		}
 
-		tag := sf.Tag.Get("json")
+		tag := sf.Tag.Get("bytecodec")
 		if tag == "-" {
 			continue
 		}
