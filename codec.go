@@ -73,10 +73,14 @@ type pointerTrack struct {
 	// reasonable amount of nested pointers deep.
 	ptrLevel uint
 	ptrSeen  map[interface{}]struct{}
+	typeSeen map[reflect.Type]struct{}
 }
 
 func newPointerTrack() pointerTrack {
-	return pointerTrack{ptrSeen: make(map[interface{}]struct{})}
+	return pointerTrack{
+		ptrSeen:  make(map[interface{}]struct{}),
+		typeSeen: make(map[reflect.Type]struct{}),
+	}
 }
 
 type CodecState struct {
@@ -223,9 +227,7 @@ func typeCodec(t reflect.Type) codec {
 	return tmp
 }
 
-var (
-	bytecoderType = reflect.TypeOf((*ByteCoder)(nil)).Elem()
-)
+var bytecoderType = reflect.TypeOf((*ByteCoder)(nil)).Elem()
 
 func newTypeCodec(t reflect.Type, allowAddr bool) codec {
 	if t.Kind() != reflect.Ptr && allowAddr && reflect.PtrTo(t).Implements(bytecoderType) {
@@ -298,10 +300,11 @@ func (byteCoderCoder) typ() reflect.Kind {
 }
 
 func (byteCoderCoder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
-	m, ok := v.Interface().(ByteCoder)
-	if !ok {
-		return
+	if v.Kind() == reflect.Ptr && v.IsNil() {
+		v = reflect.New(v.Type().Elem())
 	}
+
+	m := v.Interface().(ByteCoder)
 	err := m.MarshalBytes(c)
 	if err != nil {
 		c.error(&MarshalerError{v.Type(), err})
@@ -309,10 +312,16 @@ func (byteCoderCoder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 }
 
 func (byteCoderCoder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
-	m, ok := v.Interface().(ByteCoder)
-	if !ok {
+	// 如果没有数据，不在检测空指针并初始化它
+	if c.Len() == 0 {
 		return
 	}
+
+	if v.Kind() == reflect.Ptr && v.IsNil() {
+		v.Set(reflect.New(v.Type().Elem()))
+	}
+
+	m := v.Interface().(ByteCoder)
 	err := m.UnmarshalBytes(c)
 	if err != nil {
 		c.error(&UnmarshalerError{v.Type(), err})
@@ -328,7 +337,7 @@ func (addrByteCoderCoder) typ() reflect.Kind {
 func (addrByteCoderCoder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 	va := v.Addr()
 	if va.IsNil() {
-		return
+		va = reflect.New(v.Type().Elem())
 	}
 	m := va.Interface().(ByteCoder)
 	err := m.MarshalBytes(c)
@@ -338,9 +347,14 @@ func (addrByteCoderCoder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 }
 
 func (addrByteCoderCoder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
+	// 如果没有数据，不在检测空指针并初始化它
+	if c.Len() == 0 {
+		return
+	}
+
 	va := v.Addr()
 	if va.IsNil() {
-		return
+		v.Set(reflect.New(v.Type().Elem()))
 	}
 	m := va.Interface().(ByteCoder)
 	err := m.UnmarshalBytes(c)
@@ -669,7 +683,7 @@ func (sc stringCoder) decode(c *CodecState, v reflect.Value, to tagOptions) {
 	}
 
 	if to.bcd8421 != 0 {
-		sb, err := bcd8421.DecodeToStr(b)
+		sb, err := bcd8421.DecodeToStr(b, to.bcd8421Skipzero)
 		if err != nil {
 			c.error(&DecodeBCDErr{err})
 		}
@@ -705,6 +719,14 @@ func (interfaceCoder) encode(c *CodecState, v reflect.Value, to tagOptions) {
 	if v.IsNil() {
 		return
 	}
+
+	// Prevent infinite loop if v is an interface pointing to its own address:
+	//     var v interface{}
+	//     v = &v
+	if v.Elem().Kind() == reflect.Interface && v.Elem().Elem() == v {
+		v = v.Elem()
+	}
+
 	e := v.Elem()
 	valueCodec(e).encode(c, e, to)
 }
@@ -850,13 +872,18 @@ func (sc structCoder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 
 	for i := range sc.fields.list {
 		f := sc.fields.list[i]
+		fv := v.Field(f.index)
+
+		if f.tagOptions.bcd8421 != 0 {
+			f.tagOptions.length = f.tagOptions.bcd8421
+		}
+
 		if f.tagOptions.lengthref != "" {
 
 			found, _, refindex := sc.findref(f)
 			if !found {
 				c.error(&TagErr{fmt.Errorf("lengthref %s not fount field %s", f.name, f.tagOptions.lengthref)})
 			}
-			fv := v.Field(f.index)
 			f.codec.decode(c, fv, f.tagOptions)
 
 			var length int
@@ -884,17 +911,9 @@ func (sc structCoder) decode(c *CodecState, v reflect.Value, _ tagOptions) {
 			default:
 				c.error(&TagErr{fmt.Errorf("lengthref %s type %q is invalid", f.name, f.codec.typ())})
 			}
-
 			sc.fields.list[refindex].tagOptions.length = length
-		}
-	}
-
-	for i := range sc.fields.list {
-		f := &sc.fields.list[i]
-		if f.tagOptions.lengthref != "" {
 			continue
 		}
-		fv := v.Field(f.index)
 		f.codec.decode(c, fv, f.tagOptions)
 	}
 }
@@ -1048,8 +1067,15 @@ func (ptrCoder) typ() reflect.Kind {
 
 func (pe ptrCoder) encode(c *CodecState, v reflect.Value, to tagOptions) {
 	if v.IsNil() {
-		return
+		typ := v.Type().Elem()
+		if _, ok := c.pt.typeSeen[typ]; ok {
+			c.error(&UnsupportedValueError{v, fmt.Sprintf("encountered a cycle via %s", typ)})
+		}
+		c.pt.typeSeen[typ] = struct{}{}
+		v = reflect.New(typ)
+		defer delete(c.pt.typeSeen, typ)
 	}
+
 	if c.pt.ptrLevel++; c.pt.ptrLevel > startDetectingCyclesAfter {
 		// We're a large number of nested ptrCoder.encode calls deep;
 		// start checking if we've run into a pointer cycle.
@@ -1065,9 +1091,18 @@ func (pe ptrCoder) encode(c *CodecState, v reflect.Value, to tagOptions) {
 }
 
 func (pe ptrCoder) decode(c *CodecState, v reflect.Value, to tagOptions) {
-	if v.IsNil() {
-		// v.Set(reflect.New(v.Type().Elem()))
+	// 如果没有数据，不在检测空指针并初始化它
+	if c.Len() == 0 {
 		return
+	}
+	if v.IsNil() {
+		typ := v.Type().Elem()
+		if _, ok := c.pt.typeSeen[typ]; ok {
+			c.error(&UnsupportedValueError{v, fmt.Sprintf("encountered a cycle via %s", typ)})
+		}
+		c.pt.typeSeen[typ] = struct{}{}
+		v = reflect.New(typ)
+		defer delete(c.pt.typeSeen, typ)
 	}
 
 	if c.pt.ptrLevel++; c.pt.ptrLevel > startDetectingCyclesAfter {
@@ -1096,10 +1131,34 @@ func (condAddrCoder) typ() reflect.Kind {
 	return reflect.Invalid
 }
 
+type marshaler interface {
+	MarshalBytes(*CodecState) error
+}
+
+var marshalerType = reflect.TypeOf((*marshaler)(nil)).Elem()
+
 func (ce condAddrCoder) encode(c *CodecState, v reflect.Value, to tagOptions) {
 	if v.CanAddr() {
 		ce.canAddrC.encode(c, v, to)
 	} else {
+
+		// TODO 自定义 ByteCoder 一般是使用值接收者实现 MarshalBytes
+		// 使用指针接收者实现 UnmarshalBytes
+		// 当给 Marshal 函数传入一个值而不是指针时，这个值就没有实现 ByteCoder
+		// 也就不会使用自定义的 MarshalBytes
+		// 合理的做法应该是定义一个 Marshaler 和 Unmarshaler 而不是合在一起
+		if v.Type().Implements(marshalerType) {
+			if v.Kind() == reflect.Ptr && v.IsNil() {
+				v = reflect.New(v.Type().Elem())
+			}
+			m := v.Interface().(marshaler)
+			err := m.MarshalBytes(c)
+			if err != nil {
+				c.error(&MarshalerError{v.Type(), err})
+			}
+			return
+		}
+
 		ce.elseC.encode(c, v, to)
 	}
 }
