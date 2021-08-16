@@ -1,57 +1,3 @@
-
-# bytecodec 字节流编解码
-
-这个库实现 `struct` 或其他对象向 `[]byte` 的序列化或反序列化
-
-可以帮助你在编写 tcp 服务，或者需要操作字节流时，简化数据的组包、解包
-
-这个库的组织逻辑 ~~copy~~ 借鉴了标准库 `encoding/json` 🙏
-
-## 安装
-
-使用 `go get` 安装最新版本
-
-`go get -u github.com/lai323/bytecodec`
-
-然后在你的应用中导入
-
-`import "github.com/lai323/bytecodec"`
-
-## 使用
-
-编码时 `bytecodec` 按照 `struct` 的字段顺序将字段一个个写入到 `[]byte` 中；解码时根据字段类型读取对应长度的 `byte` 解析到字段中
-
-嵌入字段和未导出字段会被忽略，也可以使用 `bytecodec:"-"` 标签，主动忽略一个字段
-
-对于 `int` `uint` 被看作 64 位处理
-
-对于空指针字段，编码时不会被忽略，会根据这个指针的类型创建一个空对象，写入到 `[]byte` 中，所以当使用类似下面这种递归类型时，会返回错误，指示不支持这种类型
-
-```go
-type s struct {
-	Ptr1, Ptr2 *s
-}
-```
-
-`bytecodec` 支持了可转为 `byte` 所有基础类型，结合下面的几个标签可以轻松的处理一般的字节数据的组包，解包
-
-- `bytecodec:"length:5"` 用于指定 string slice 等不能确定长度的类型的固定字节长度
-- `bytecodec:"lengthref:FieldName"` 用于控制不定长的数据，例如典型的，先从字节流中读取长度，在按这个长度读取后续数据
-- `bytecodec:"gbk18030"` `bytecodec:"gbk18030"` 用于为字符串类型指定编码格式
-- `bytecodec:"bcd8421:5,true"` 使用 BCD 压缩，第一个参数是压缩后 byte 长度，不足时在前面填充 0，第二个参数指示解码时，是否跳过首部的 0，这个标签应该使用在字符串类型的字段上，使用字符串表示数值，是为了处理较长的数字串
-
-对于更加复杂的数据结构，你可以实现 `bytecodec.ByteCoder` 自定义编解码
-
-```go
-type ByteCoder interface {
-	MarshalBytes(*bytecodec.CodecState) error
-	UnmarshalBytes(*bytecodec.CodecState) error
-}
-```
-
-## 例子
-
-```go
 package main
 
 import (
@@ -158,5 +104,3 @@ func main() {
 	// <SerialNo:1,Time:060102150405,Phone:18102169375,MsgLength:4,Msg:你好>
 	// <nil>
 }
-
-```
