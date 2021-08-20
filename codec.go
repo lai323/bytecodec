@@ -86,6 +86,7 @@ func newPointerTrack() pointerTrack {
 type CodecState struct {
 	bytes.Buffer
 	pt *pointerTrack
+	v  map[string]interface{}
 }
 
 const startDetectingCyclesAfter = 1000
@@ -118,6 +119,17 @@ func (c *CodecState) unmarshal(v reflect.Value) error {
 
 func (c *CodecState) gensub() *CodecState {
 	return subCodecState(c.pt)
+}
+
+func (c *CodecState) set(k string, v interface{}) {
+	if c.v == nil {
+		c.v = map[string]interface{}{}
+	}
+	c.v[k] = v
+}
+
+func (c *CodecState) get(k string) interface{} {
+	return c.v[k]
 }
 
 type bytecodecError struct{ error }
@@ -632,6 +644,7 @@ func (stringCoder) checklength(c *CodecState, taglengt, length int) {
 	if taglengt > 0 && length != taglengt {
 		c.error(&LengthErr{fmt.Errorf("string length %d tag length %d", length, taglengt)})
 	}
+	c.set("length", length)
 }
 
 func (sc stringCoder) encode(c *CodecState, v reflect.Value, to tagOptions) {
@@ -830,7 +843,7 @@ func (sc structCoder) encodeLengthref(c *CodecState, lengthref, ref field, lengt
 	refbytes := append([]byte(nil), scc.Bytes()...)
 	encodeStatePool.Put(scc)
 
-	length := len(refbytes)
+	length := scc.get("length").(int)
 	var lengthv reflect.Value
 
 	switch lengthref.codec.typ() {
@@ -946,29 +959,13 @@ func (ac arrayCoder) encode(c *CodecState, v reflect.Value, to tagOptions) {
 }
 
 func (ac arrayCoder) decode(c *CodecState, v reflect.Value, to tagOptions) {
-	if to.length == 0 {
-		return
-	}
-
-	var b []byte
-	if to.length > 0 {
-		b = make([]byte, to.length)
-		c.ReadFull(b)
-	} else {
-		b = make([]byte, c.Len())
-		c.ReadFull(b)
-	}
-	scc := c.gensub()
-	scc.Write(b)
-
 	i := 0
 	for {
-		if i >= v.Len() {
-			break
-		}
-		ac.elemCodec.decode(scc, v.Index(i), to)
-		if scc.Len() == 0 {
-			break
+		if i < v.Len() {
+			ac.elemCodec.decode(c, v.Index(i), to)
+			if c.Len() == 0 {
+				break
+			}
 		}
 		i++
 	}
@@ -979,7 +976,6 @@ func (ac arrayCoder) decode(c *CodecState, v reflect.Value, to tagOptions) {
 			v.Index(i).Set(z)
 		}
 	}
-	encodeStatePool.Put(scc)
 }
 
 func newArrayCoder(t reflect.Type) codec {
@@ -996,36 +992,20 @@ func (sliceCoder) typ() reflect.Kind {
 
 func (sc sliceCoder) encode(c *CodecState, v reflect.Value, to tagOptions) {
 	n := v.Len()
-	pl := c.Len()
 
 	for i := 0; i < n; i++ {
 		sc.elemCodec.encode(c, v.Index(i), to)
 	}
 
-	length := c.Len() - pl
-	if to.length > 0 && length != to.length {
-		c.error(&LengthErr{fmt.Errorf("slice length %d tag length %d", length, to.length)})
+	if to.length > 0 && n != to.length {
+		c.error(&LengthErr{fmt.Errorf("slice length %d tag length %d", n, to.length)})
 	}
+	c.set("length", n)
 }
 
 func (sc sliceCoder) decode(c *CodecState, v reflect.Value, to tagOptions) {
-	if to.length == 0 {
-		return
-	}
-
-	var b []byte
-	if to.length > 0 {
-		b = make([]byte, to.length)
-		c.ReadFull(b)
-	} else {
-		b = make([]byte, c.Len())
-		c.ReadFull(b)
-	}
-	scc := c.gensub()
-	scc.Write(b)
-
 	i := 0
-	for {
+	for ; (to.length < 0 || i < to.length) && c.Len() != 0; i++ {
 		// Grow slice if necessary
 		if i >= v.Cap() {
 			newcap := v.Cap() + v.Cap()/2
@@ -1040,17 +1020,12 @@ func (sc sliceCoder) decode(c *CodecState, v reflect.Value, to tagOptions) {
 			v.SetLen(i + 1)
 		}
 
-		sc.elemCodec.decode(scc, v.Index(i), to)
-		if scc.Len() == 0 {
-			break
-		}
-		i++
+		sc.elemCodec.decode(c, v.Index(i), to)
 	}
 
 	if i == 0 {
 		v.Set(reflect.MakeSlice(v.Type(), 0, 0))
 	}
-	encodeStatePool.Put(scc)
 }
 
 func newSliceCoder(t reflect.Type) codec {

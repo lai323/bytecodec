@@ -35,7 +35,7 @@ type s struct {
 
 `bytecodec` 支持了可转为 `byte` 所有基础类型，结合下面的几个标签可以轻松的处理一般的字节数据的组包，解包
 
-- `bytecodec:"length:5"` 用于指定 string slice 等不能确定长度的类型的固定字节长度
+- `bytecodec:"length:5"` 用于指定不能确定长度的类型的固定长度，对于 `string` 指的是字符串的字节长度，对于 `slice` 指的是元素个数，其他类型会忽略这个标签
 - `bytecodec:"lengthref:FieldName"` 用于控制不定长的数据，例如典型的，先从字节流中读取长度，在按这个长度读取后续数据
 - `bytecodec:"gbk"` `bytecodec:"gbk18030"` 用于为字符串类型指定编码格式
 - `bytecodec:"bcd8421:5,true"` 使用 BCD 压缩，第一个参数是压缩后 byte 长度，不足时在前面填充 0，第二个参数指示解码时，是否跳过首部的 0，这个标签应该使用在字符串类型的字段上，使用字符串表示数值，是为了处理较长的数字串
