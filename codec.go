@@ -814,7 +814,9 @@ func (sc structCoder) encode(c *CodecState, v reflect.Value, _ tagOptions) {
 		buf[i] = append([]byte(nil), scc.Bytes()...)
 		encodeStatePool.Put(scc)
 	}
-	c.Write(bytes.Join(buf, []byte{}))
+	structBytes := bytes.Join(buf, []byte{})
+	c.set("length", len(structBytes))
+	c.Write(structBytes)
 }
 
 func (sc structCoder) findref(f field) (found bool, ref field, refindex int) {
