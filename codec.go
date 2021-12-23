@@ -945,16 +945,8 @@ func (arrayCoder) typ() reflect.Kind {
 }
 
 func (ac arrayCoder) encode(c *CodecState, v reflect.Value, to tagOptions) {
-	n := v.Len()
-	pl := c.Len()
-
-	for i := 0; i < n; i++ {
+	for i := 0; i < v.Len(); i++ {
 		ac.elemCodec.encode(c, v.Index(i), to)
-	}
-
-	length := c.Len() - pl
-	if to.length > 0 && length != to.length {
-		c.error(&LengthErr{fmt.Errorf("array length %d tag length %d", length, to.length)})
 	}
 }
 
